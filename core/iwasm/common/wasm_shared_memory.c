@@ -111,6 +111,7 @@ notify_stale_threads_on_exception(WASMModuleInstanceCommon *module_inst)
 {
     AtomicWaitAddressArgs args = { 0 };
     uint32 i = 0, total_elem_count = 0;
+    const uint64 total_elem_count_size = 0;
 
     os_mutex_lock(&shared_memory_list_lock);
 
@@ -118,8 +119,13 @@ notify_stale_threads_on_exception(WASMModuleInstanceCommon *module_inst)
     bh_hash_map_traverse(wait_map, wait_map_address_count_callback,
                          (void *)&total_elem_count);
 
+    if (!total_elem_count)
+        return;
+
     /* allocate memory */
-    if (!(args.addr = wasm_runtime_malloc(sizeof(void *) * total_elem_count))) {
+    total_elem_count_size = (uint64)sizeof(void *) * total_elem_count;
+    if (total_elem_count_size >= UINT32_MAX
+        || !(args.addr = wasm_runtime_malloc((uint32)total_elem_count_size))) {
         LOG_ERROR(
             "failed to allocate memory for list of atomic wait addresses");
         os_mutex_unlock(&shared_memory_list_lock);
@@ -136,7 +142,8 @@ notify_stale_threads_on_exception(WASMModuleInstanceCommon *module_inst)
     }
 
     /* free memory allocated to args data */
-    wasm_runtime_free(args.addr);
+    if (args.addr)
+        wasm_runtime_free(args.addr);
 }
 
 WASMSharedMemNode *

@@ -951,6 +951,43 @@ wasi_path_remove_directory(wasm_exec_env_t exec_env, wasi_fd_t fd,
     return wasmtime_ssp_path_remove_directory(curfds, fd, path, path_len);
 }
 
+static __wasi_timestamp_t
+get_timeout_for_poll_oneoff(const wasi_subscription_t *in,
+                            uint32 nsubscriptions)
+{
+    __wasi_timestamp_t timeout = 0;
+    const __wasi_subscription_t *clock_subscription = NULL;
+
+    for (size_t i = 0; i < nsubscriptions; ++i) {
+        const __wasi_subscription_t *s = &in[i];
+        if (s->u.type == __WASI_EVENTTYPE_CLOCK
+            && (s->u.u.clock.flags & __WASI_SUBSCRIPTION_CLOCK_ABSTIME) == 0) {
+            clock_subscription = s;
+            break;
+        }
+    }
+    if (clock_subscription != NULL) {
+        __wasi_timestamp_t ts = clock_subscription->u.u.clock.timeout;
+        timeout = ts;
+    }
+    else {
+        timeout = (__wasi_timestamp_t)-1;
+    }
+    return timeout; /* returns timeout in ns */
+}
+
+static void
+update_clock_subscription_data(wasi_subscription_t *in, uint32 nsubscriptions,
+                               const wasi_timestamp_t new_timeout)
+{
+    for (size_t i = 0; i < nsubscriptions; ++i) {
+        const __wasi_subscription_t *s = &in[i];
+        if (s->u.type == __WASI_EVENTTYPE_CLOCK) {
+            s->u.u.clock.timeout = new_timeout;
+        }
+    }
+}
+
 static wasi_errno_t
 wasi_poll_oneoff(wasm_exec_env_t exec_env, const wasi_subscription_t *in,
                  wasi_event_t *out, uint32 nsubscriptions, uint32 *nevents_app)
@@ -969,9 +1006,49 @@ wasi_poll_oneoff(wasm_exec_env_t exec_env, const wasi_subscription_t *in,
         || !validate_native_addr(nevents_app, sizeof(uint32)))
         return (wasi_errno_t)-1;
 
-    err = wasmtime_ssp_poll_oneoff(curfds, in, out, nsubscriptions, &nevents);
-    if (err)
-        return err;
+    __wasi_timestamp_t elapsed = 0;
+    const __wasi_timestamp_t timeout = get_timeout_for_poll_oneoff(
+                                 in, nsubscriptions),
+                             time_quant = 1e9;
+    const uint64 size_to_copy = nsubscriptions * sizeof(wasi_subscription_t);
+    __wasi_subscription_t *in_copy = NULL;
+    if (size_to_copy >= UINT32_MAX
+        || (size_to_copy
+            && !(in_copy = (__wasi_subscription_t *)wasm_runtime_malloc(
+                     (uint32)size_to_copy)))) {
+        return (wasi_errno_t)-1;
+    }
+    bh_memcpy_s(in_copy, size_to_copy, in, size_to_copy);
+
+    while (1) {
+        elapsed += time_quant;
+        if (timeout != (__wasi_timestamp_t)-1 && elapsed > timeout)
+            break;
+
+        /* update timeout for clock subscription events */
+        update_clock_subscription_data(&in_copy, nsubscriptions, time_quant);
+        err = wasmtime_ssp_poll_oneoff(curfds, in_copy, out, nsubscriptions,
+                                       &nevents);
+        if (err) {
+            if (in_copy)
+                wasm_runtime_free(in_copy);
+            return err;
+        }
+
+        if (wasm_runtime_get_exception(module_inst) || nevents > 0) {
+            if (in_copy)
+                wasm_runtime_free(in_copy);
+
+            if (nevents) {
+                *nevents_app = (uint32)nevents;
+                return 0;
+            }
+            return EINTR;
+        }
+    }
+
+    if (in_copy)
+        wasm_runtime_free(in_copy);
 
     *nevents_app = (uint32)nevents;
     return 0;
